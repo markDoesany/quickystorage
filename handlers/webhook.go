@@ -5,17 +5,35 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/markDoesany/quickymessenger/database"
 	"github.com/markDoesany/quickymessenger/models"
 	"github.com/markDoesany/quickymessenger/services"
+	"github.com/markDoesany/quickymessenger/templates"
+	"github.com/markDoesany/quickymessenger/utils"
 )
 
-const VERIFY_TOKEN = "12345"
+var userState = make(map[string]string)
+var userStorage = make(map[string][]models.StorageContent)
+var mu sync.Mutex
 
-// Temporary in-memory storage to track user interactions
-var userState = make(map[string]string) // senderID -> state
-var mu sync.Mutex                       // Mutex to handle concurrency
+var storage_index int = 0
+
+func InitializeUserStorage(senderID string) {
+	var storageContents []models.StorageContent
+	err := database.DB.Preload("Contents").Where("sender_id = ?", senderID).Find(&storageContents).Error
+	if err != nil {
+		log.Fatalf("Failed to load storage contents from database for senderID %s: %v", senderID, err)
+	}
+
+	userStorage[senderID] = append(userStorage[senderID], storageContents...)
+	log.Printf("User storage initialized from database for senderID %s", senderID)
+}
 
 // Webhook handles incoming requests from Messenger
 func Webhook(w http.ResponseWriter, r *http.Request) {
@@ -28,7 +46,7 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodGet {
 		verifyToken := r.URL.Query().Get("hub.verify_token")
-		if verifyToken != VERIFY_TOKEN {
+		if verifyToken != os.Getenv("VERIFY_TOKEN") {
 			log.Println("Invalid verification token")
 			return
 		}
@@ -60,9 +78,9 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Send the "Get Started" button template initially
 	if _, exists := userState[senderID]; !exists {
-		err = services.SendMessage(senderID, services.ButtonTemplateGetStarted(senderID))
+		InitializeUserStorage(senderID)
+		err = services.SendMessage(senderID, templates.ButtonTemplateGetStarted(senderID))
 		if err != nil {
 			log.Printf("Failed to send message: %v", err)
 		}
@@ -70,158 +88,211 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle postback payloads
 	if message.Entry[0].Messaging[0].Postback.Payload != "" {
-		payload := message.Entry[0].Messaging[0].Postback.Payload
+		handlePostbackPayload(senderID, message.Entry[0].Messaging[0].Postback.Payload)
+		return
+	}
 
-		switch payload {
-		case "GET_STARTED_PAYLOAD":
+	handleTextInput(senderID, message)
+}
+
+func handlePostbackPayload(senderID, payload string) {
+	var err error
+	switch payload {
+	case "GET_STARTED_PAYLOAD":
+		userState[senderID] = "waiting_for_action"
+		err = services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
+	case "SEARCH_STORAGE_PAYLOAD":
+		log.Printf("Handling SEARCH_STORAGE_PAYLOAD for senderID: %s", senderID)
+		userState[senderID] = "searching"
+		storages := getUserStorages(senderID)
+		if len(storages) == 0 {
+			err = services.SendMessage(senderID, services.TextMessage(senderID, "No storages found."))
+			if err != nil {
+				log.Fatal(err)
+			}
 			userState[senderID] = "waiting_for_action"
-			err = services.SendMessage(senderID, services.ButtonTemplateMessage(senderID))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-			return
-
-		case "SEARCH_STORAGE_PAYLOAD":
-			userState[senderID] = "searching"
-			// Send list of storages (dummy data for now)
-			storages := []string{"Storage 1", "Storage 2", "Storage 3"}
+			err = services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
+		} else {
 			err = services.SendMessage(senderID, services.ListStoragesMessage(senderID, storages))
+		}
+	case "CREATE_STORAGE_PAYLOAD":
+		userState[senderID] = "creating"
+		err = services.SendMessage(senderID, services.TextMessage(senderID, "Please enter the storage name:"))
+	case "REMOVE_STORAGE_PAYLOAD":
+		userState[senderID] = "removing"
+		storages := getUserStorages(senderID)
+		err = services.SendMessage(senderID, services.RemoveListStoragesMessage(senderID, storages))
+	case "ADD_DATA_PAYLOAD":
+		userState[senderID] = "waiting_for_data"
+		err = services.SendMessage(senderID, services.TextMessage(senderID, "Please send a text message (image not yet supported)."))
+	case "EXIT_PAYLOAD":
+		userState[senderID] = "waiting_for_action"
+		err = services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
+	default:
+		if strings.HasPrefix(payload, "STORAGE_") {
+			storageIndex := strings.TrimPrefix(payload, "STORAGE_")
+			log.Printf("Handling STORAGE selection for storageIndex: %s", storageIndex)
+			index, err := strconv.Atoi(storageIndex)
 			if err != nil {
-				log.Printf("Failed to send message: %v", err)
+				log.Printf("Invalid storage index: %s", storageIndex)
+				return
 			}
-			return
-
-		case "CREATE_STORAGE_PAYLOAD":
-			userState[senderID] = "creating"
-			err = services.SendMessage(senderID, services.TextMessage(senderID, "Please enter the storage name:"))
+			storage_index = index - 1
+			handleStorageSelection(senderID, index)
+		} else if strings.HasPrefix(payload, "REMOVE_STORAGE_") {
+			storageIndex := strings.TrimPrefix(payload, "REMOVE_STORAGE_")
+			log.Printf("Handling STORAGE Removal for storageIndex: %s", storageIndex)
+			index, err := strconv.Atoi(storageIndex)
 			if err != nil {
-				log.Printf("Failed to send message: %v", err)
+				log.Printf("Invalid storage index: %s", storageIndex)
+				return
 			}
-			return
-
-		case "REMOVE_STORAGE_PAYLOAD":
-			userState[senderID] = "removing"
-			// Send list of storages (dummy data for now)
-			storages := []string{"Storage 1", "Storage 2", "Storage 3"}
-			err = services.SendMessage(senderID, services.ListStoragesMessage(senderID, storages))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-			return
-
-		case "ADD_DATA_PAYLOAD":
-			userState[senderID] = "waiting_for_data"
-			err = services.SendMessage(senderID, services.TextMessage(senderID, "Please send a text message or an image."))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-			return
-
-		case "EXIT_PAYLOAD":
-			userState[senderID] = "waiting_for_action"
-			err = services.SendMessage(senderID, services.ButtonTemplateMessage(senderID))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-			return
-
-		default:
+			storage_index = index - 1
+			handleRemoveStorageSelection(senderID, index)
+		} else {
 			userState[senderID] = "waiting_for_action"
 			err = services.SendMessage(senderID, services.TextMessage(senderID, "Invalid selection. Please choose an option."))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-			err = services.SendMessage(senderID, services.ButtonTemplateMessage(senderID))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
+			if err == nil {
+				err = services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
 			}
 		}
 	}
+	if err != nil {
+		log.Printf("Failed to send message: %v", err)
+	}
+}
 
-	// Process text-based user input (for follow-ups after button clicks)
+func handleTextInput(senderID string, message models.Message) {
+	var err error
 	state, exists := userState[senderID]
 	if exists {
 		switch state {
 		case "creating":
-			// Store the storage name and ask for data
 			storageName := message.Entry[0].Messaging[0].Message.Text
+			log.Printf("Creating storage with name: %s for senderID: %s", storageName, senderID)
+			userStorage[senderID] = append(userStorage[senderID], models.StorageContent{StorageName: storageName, Contents: []models.Content{}})
 			userState[senderID] = "storing_data"
-			err = services.SendMessage(senderID, services.TextMessage(senderID, "Storage created: "+storageName+". Do you want to add data or exit?"))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
+			storages := getUserStorages(senderID)
+			storage_index = len(storages) - 1
+			err = services.SendMessage(senderID, services.TextMessage(senderID, "Storage created: *"+storageName+"*"))
+			if err == nil {
+				err = services.SendMessage(senderID, templates.ButtonTemplateAddOrExit(senderID))
 			}
-			err = services.SendMessage(senderID, services.ButtonTemplateAddOrExit(senderID))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-
 		case "storing_data":
-			// Ask for text or image data
 			userState[senderID] = "waiting_for_data"
 			err = services.SendMessage(senderID, services.TextMessage(senderID, "Please send a text message or an image."))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-
 		case "waiting_for_data":
-			// Store the data and ask for more or exit
-			data := message.Entry[0].Messaging[0].Message.Text // Handle image data separately
+			var data string
+			// if len(message.Entry[0].Messaging[0].Message.Attachments) > 0 {
+			// 	attachment := message.Entry[0].Messaging[0].Message.Attachments[0]
+			// 	if attachment.Type == "image" {
+			// 		data = attachment.Payload.URL
+			// 		log.Printf("Received image URL: %s", data)
+			// 	} else {
+			// 		log.Printf("Unsupported attachment type: %s", attachment.Type)
+			// 		err = services.SendMessage(senderID, services.TextMessage(senderID, "Unsupported attachment type. Please send an image."))
+			// 		break
+			// 	}
+			// } else {
+			// }
+			data = message.Entry[0].Messaging[0].Message.Text
+			timestamp := time.Now()
+			log.Printf("Storing data: %s with timestamp: %s for senderID: %s", data, timestamp, senderID)
+			err = database.StoreDataInDB(senderID, userStorage[senderID][storage_index].StorageName, timestamp, data)
+			if err != nil {
+				log.Printf("Failed to store data in database: %v", err)
+				break
+			}
 			userState[senderID] = "storing_data"
-			err = services.SendMessage(senderID, services.TextMessage(senderID, "Data stored: "+data+". Do you want to add more data or exit?"))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
+			err = services.SendMessage(senderID, services.TextMessage(senderID, "Data stored: "+data+"."))
+			if err == nil {
+				err = services.SendMessage(senderID, templates.ButtonTemplateAddOrExit(senderID))
 			}
-			err = services.SendMessage(senderID, services.ButtonTemplateAddOrExit(senderID))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-
 		case "searching":
-			// Handle storage search and return data
-			storageIndex := message.Entry[0].Messaging[0].Message.Text
-			// Retrieve and send storage data (dummy data for now)
-			storageData := "Data for storage " + storageIndex
-			err = services.SendMessage(senderID, services.TextMessage(senderID, storageData))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-			userState[senderID] = "waiting_for_action"
-			err = services.SendMessage(senderID, services.ButtonTemplateMessage(senderID))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-
-		case "removing":
-			// Handle storage removal
-			storageIndex := message.Entry[0].Messaging[0].Message.Text
-			// Remove storage (dummy action for now)
-			err = services.SendMessage(senderID, services.TextMessage(senderID, "Storage "+storageIndex+" removed."))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-			userState[senderID] = "waiting_for_action"
-			err = services.SendMessage(senderID, services.ButtonTemplateMessage(senderID))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-
+			storageName := message.Entry[0].Messaging[0].Message.Text
+			log.Printf("Searching storage with name: %s for senderID: %s", storageName, senderID)
 		default:
 			userState[senderID] = "waiting_for_action"
 			err = services.SendMessage(senderID, services.TextMessage(senderID, "I didn't understand that. Click a button to proceed."))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-			}
-			err = services.SendMessage(senderID, services.ButtonTemplateMessage(senderID))
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
+			if err == nil {
+				err = services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
 			}
 		}
 	} else {
 		err = services.SendMessage(senderID, services.TextMessage(senderID, "Click 'Get Started' to begin."))
+	}
+	if err != nil {
+		log.Printf("Failed to send message: %v", err)
+	}
+}
+
+func handleStorageSelection(senderID string, index int) error {
+	storages, exists := userStorage[senderID]
+	if !exists || len(storages) == 0 {
+		log.Printf("No storages found for senderID: %s", senderID)
+		return services.SendMessage(senderID, services.TextMessage(senderID, "You don't have any storages."))
+	}
+
+	storage := storages[index-1]
+	log.Printf("Retrieving storage: %s for senderID: %s", storage.StorageName, senderID)
+
+	contents, err := database.GetStorageData(senderID, storage.StorageName)
+	if err != nil {
+		log.Printf("Failed to get storage content: %v", err)
+		return err
+	}
+	if len(contents) == 0 {
+		services.SendMessage(senderID, services.TextMessage(senderID, "No data found in storage: _"+storage.StorageName+"_"))
+	}
+
+	log.Printf("Storage contents for %s: %v", storage.StorageName, contents)
+	err = services.SendMessage(senderID, services.TextMessage(senderID, "Storage Name: "+storage.StorageName))
+	if err != nil {
+		log.Printf("Failed to send storage content: %v", err)
+		return err
+	}
+	for _, content := range contents {
+		responseMessage := "Timestamp:\n" + utils.FormatTimestamp(content.Timestamp) + "\n\nData:\n" + content.Data
+		err := services.SendMessage(senderID, services.TextMessage(senderID, responseMessage))
 		if err != nil {
-			log.Printf("Failed to send message: %v", err)
+			log.Printf("Failed to send storage content: %v", err)
+			return err
 		}
 	}
+
+	userState[senderID] = "waiting_for_action"
+	err = services.SendMessage(senderID, templates.ButtonTemplateAddOrExit(senderID))
+
+	return err
+}
+
+func handleRemoveStorageSelection(senderID string, index int) error {
+	storages, exists := userStorage[senderID]
+	if !exists || len(storages) == 0 {
+		log.Printf("No storages found for senderID: %s", senderID)
+		return services.SendMessage(senderID, services.TextMessage(senderID, "You don't have any storages."))
+	}
+
+	storage_ := storages[index-1]
+	log.Printf("Retrieving storage: %s for senderID: %s", storage_.StorageName, senderID)
+
+	for i, storage := range userStorage[senderID] {
+		if storage.StorageName == storage_.StorageName {
+			userStorage[senderID] = append(userStorage[senderID][:i], userStorage[senderID][i+1:]...)
+			break
+		}
+	}
+	userState[senderID] = "waiting_for_action"
+	err := services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
+
+	return err
+}
+
+func getUserStorages(senderID string) []string {
+	storages := []string{}
+	for _, storage := range userStorage[senderID] {
+		storages = append(storages, storage.StorageName)
+	}
+	return storages
 }

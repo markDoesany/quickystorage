@@ -4,11 +4,16 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/joho/godotenv"
 	"github.com/markDoesany/quickymessenger/database"
 	"github.com/markDoesany/quickymessenger/handlers"
 )
 
 func main() {
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Fatalf("Error loading .env file: %v", err)
+	}
 	database.InitDB()
 	handler := http.NewServeMux()
 	handler.HandleFunc("/", handlers.Webhook)
