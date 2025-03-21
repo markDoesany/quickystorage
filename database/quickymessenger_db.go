@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/markDoesany/quickymessenger/models"
+	"github.com/markDoesany/quickymessenger/utils"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -46,10 +47,16 @@ func StoreDataInDB(senderID, storageName string, timestamp time.Time, data strin
 		}
 	}
 
+	encryptionKey := []byte(os.Getenv("ENCRYPTION_KEY"))
+	encryptedData, err := utils.Encrypt(data, encryptionKey)
+	if err != nil {
+		return err
+	}
+
 	content := models.Content{
 		StorageContentID: storageContent.ID,
 		Timestamp:        timestamp,
-		Data:             data,
+		Data:             encryptedData,
 	}
 	return DB.Create(&content).Error
 }
@@ -66,6 +73,16 @@ func GetStorageData(senderID, storageName string) ([]models.Content, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	encryptionKey := []byte(os.Getenv("ENCRYPTION_KEY"))
+	for i, content := range contents {
+		decryptedData, err := utils.Decrypt(content.Data, encryptionKey)
+		if err != nil {
+			return nil, err
+		}
+		contents[i].Data = decryptedData
+	}
+
 	log.Print(contents)
 	return contents, nil
 }
