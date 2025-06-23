@@ -98,11 +98,11 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 func handlePostbackPayload(senderID, payload string) {
 	var err error
-	switch payload {
-	case "GET_STARTED_PAYLOAD":
+	switch {
+	case payload == "GET_STARTED_PAYLOAD":
 		userState[senderID] = "waiting_for_action"
 		err = services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
-	case "SEARCH_STORAGE_PAYLOAD":
+	case payload == "SEARCH_STORAGE_PAYLOAD":
 		log.Printf("Handling SEARCH_STORAGE_PAYLOAD for senderID: %s", senderID)
 		userState[senderID] = "searching"
 		storages := getUserStorages(senderID)
@@ -113,34 +113,52 @@ func handlePostbackPayload(senderID, payload string) {
 			}
 			userState[senderID] = "waiting_for_action"
 			err = services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
-		} else {
-			err = services.SendMessage(senderID, services.ListStoragesMessage(senderID, storages))
+			return
 		}
-	case "CREATE_STORAGE_PAYLOAD":
+		err = services.SendMessage(senderID, services.ListStoragesMessage(senderID, storages))
+		if err != nil {
+			log.Fatal(err)
+		}
+	case strings.HasPrefix(payload, "STORAGE_"):
+		// Handle storage selection from carousel or button template
+		storageIndexStr := strings.TrimPrefix(payload, "STORAGE_")
+		if storageIndexStr == "" {
+			err = services.SendMessage(senderID, services.TextMessage(senderID, "Invalid storage selection."))
+			break
+		}
+		index, err := strconv.Atoi(storageIndexStr)
+		if err != nil {
+			log.Printf("Invalid storage index: %s", storageIndexStr)
+			err = services.SendMessage(senderID, services.TextMessage(senderID, "Invalid storage selection."))
+			break
+		}
+		handleStorageSelection(senderID, index)
+	case strings.HasPrefix(payload, "STORAGE_PAGE_"):
+		// Handle carousel pagination
+		pageIndexStr := strings.TrimPrefix(payload, "STORAGE_PAGE_")
+		pageIndex, err := strconv.Atoi(pageIndexStr)
+		if err != nil {
+			log.Printf("Invalid page index: %s", pageIndexStr)
+			err = services.SendMessage(senderID, services.TextMessage(senderID, "Invalid page."))
+			break
+		}
+		storages := getUserStorages(senderID)
+		err = services.SendMessage(senderID, templates.StorageCarouselTemplate(senderID, storages, pageIndex))
+	case payload == "CREATE_STORAGE_PAYLOAD":
 		userState[senderID] = "creating"
 		err = services.SendMessage(senderID, services.TextMessage(senderID, "Please enter the storage name:"))
-	case "REMOVE_STORAGE_PAYLOAD":
+	case payload == "REMOVE_STORAGE_PAYLOAD":
 		userState[senderID] = "removing"
 		storages := getUserStorages(senderID)
 		err = services.SendMessage(senderID, services.RemoveListStoragesMessage(senderID, storages))
-	case "ADD_DATA_PAYLOAD":
+	case payload == "ADD_DATA_PAYLOAD":
 		userState[senderID] = "waiting_for_data"
 		err = services.SendMessage(senderID, services.TextMessage(senderID, "Please send a text message (image not yet supported)."))
-	case "EXIT_PAYLOAD":
+	case payload == "EXIT_PAYLOAD":
 		userState[senderID] = "waiting_for_action"
 		err = services.SendMessage(senderID, templates.ButtonTemplateMessage(senderID))
 	default:
-		if strings.HasPrefix(payload, "STORAGE_") {
-			storageIndex := strings.TrimPrefix(payload, "STORAGE_")
-			log.Printf("Handling STORAGE selection for storageIndex: %s", storageIndex)
-			index, err := strconv.Atoi(storageIndex)
-			if err != nil {
-				log.Printf("Invalid storage index: %s", storageIndex)
-				return
-			}
-			storage_index = index - 1
-			handleStorageSelection(senderID, index)
-		} else if strings.HasPrefix(payload, "REMOVE_STORAGE_") {
+		if strings.HasPrefix(payload, "REMOVE_STORAGE_") {
 			storageIndex := strings.TrimPrefix(payload, "REMOVE_STORAGE_")
 			log.Printf("Handling STORAGE Removal for storageIndex: %s", storageIndex)
 			index, err := strconv.Atoi(storageIndex)
